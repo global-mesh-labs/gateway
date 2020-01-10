@@ -30,6 +30,8 @@ try:
 except ImportError:
     pass
 
+SMS_GATEWAY_GID = "555555555"
+
 class goTennaCLI(cmd.Cmd):
     """ CLI handler function
     """
@@ -37,7 +39,7 @@ class goTennaCLI(cmd.Cmd):
         self.api_thread = None
         self.status = {}
         cmd.Cmd.__init__(self)
-        self.prompt = 'goTenna>'
+        self.prompt = 'SMS Gateway>'
         self.in_flight_events = {}
         self._set_frequencies = False
         self._set_tx_power = False
@@ -48,6 +50,8 @@ class goTennaCLI(cmd.Cmd):
             geo_settings=goTenna.settings.GeoSettings())
         self._do_encryption = True
         self._awaiting_disconnect_after_fw_update = [False]
+        self.serial_port = None
+        self.serial_rate = 115200
 
     def precmd(self, line):
         if not self.api_thread\
@@ -841,17 +845,26 @@ class goTennaCLI(cmd.Cmd):
     def send_ser_command(self, ser, command):
             ser.write(command.encode())
             sleep(0.2)
+            ret = []
+            while ser.inWaiting() > 0:
+                msg = str(ser.readline().strip())
+                msg = msg.replace('\r','')
+                msg = msg.replace('\n','')
+                if msg!="":
+                    ret.append(msg)
+            return ret
 
     def do_send_sms(self, args):
+        """ Send an SMS message to a particular phone number.
 
-        SERIAL_PORT = '/dev/ttyp0' # TBD: set a fixed com port or read command line arg
-        SERIAL_RATE = 115200
+        Usage: send_sms PHONE_NUMBER MESSAGE
+        """
         OPERATE_SMS_MODE = 'AT+CMGF=1\r'
         SEND_SMS = 'AT+CMGS="{}"\r'
         SEND_CLOSE = '\x1A'	#sending CTRL-Z
 
         try:
-            ser = serial.Serial(SERIAL_PORT, SERIAL_RATE, write_timeout=2)
+            ser = serial.Serial(self.serial_port, self.serial_rate, write_timeout=2)
 
             phone_number, message = args.split(' ',1)
             
@@ -862,11 +875,83 @@ class goTennaCLI(cmd.Cmd):
                 ser.open()
 
             if ser.is_open:
+                # Set SMS format to text mode
                 self.send_ser_command(ser, OPERATE_SMS_MODE)
+                # send SMS message
                 self.send_ser_command(ser, SEND_SMS.format(phone_number))
                 self.send_ser_command(ser, message)
+                # close serial connection
                 self.send_ser_command(ser, SEND_CLOSE)
+                ser.close()
 
+        except serial.SerialTimeoutException:
+            ser.close()
+
+    def do_read_sms(self, args):
+        """ Read all unread SMS messages received.
+
+        Usage: read_sms
+        """
+        OPERATE_SMS_MODE = 'AT+CMGF=1\r'
+        SEND_CLOSE = '\x1A'	#sending CTRL-Z
+        RETRIEVE_UNREAD = 'AT+CMGL="REC UNREAD"\r'
+
+        try:
+            ser = serial.Serial(self.serial_port, self.serial_rate, write_timeout=2)
+            print("Checking for unread SMS messages.")
+
+            if not ser.is_open:
+                ser.open()
+
+            if ser.is_open:
+                # Set SMS format to text mode
+                self.send_ser_command(ser, OPERATE_SMS_MODE)
+                # retrieve all unread SMS messages
+                list = self.send_ser_command(ser, RETRIEVE_UNREAD)
+                msgs = []
+                header = ""
+                for item in list:
+                    #print items
+                    if item.startswith("+CMGL:"):
+                        header = item
+                    else:
+                        if item!="OK":
+                            msgs.append({header, item})
+
+                # close serial connection
+                self.send_ser_command(ser, SEND_CLOSE)
+                ser.close()
+
+                # TODO: parse and forward over mesh
+                print(msgs)
+
+        except serial.SerialTimeoutException:
+            ser.close()
+
+    def do_delete_sms(self, args):
+        """ Delete all read and sent SMS messages from phone storage.
+
+        Usage: delete_sms
+        """
+        OPERATE_SMS_MODE = 'AT+CMGF=1\r'
+        SEND_CLOSE = '\x1A'	#sending CTRL-Z
+        DELETE_READ_SENT = 'AT+CMGD=0,2\r' 
+
+        try:
+            ser = serial.Serial(self.serial_port, self.serial_rate, write_timeout=2)
+            
+            print("Deleting all read and sent SMS messages.")
+
+            if not ser.is_open:
+                ser.open()
+
+            if ser.is_open:
+                # Set SMS format to text mode
+                self.send_ser_command(ser, OPERATE_SMS_MODE)
+                # delete all read and sent messages
+                self.send_ser_command(ser, DELETE_READ_SENT)
+                # close serial connection
+                self.send_ser_command(ser, SEND_CLOSE)
                 ser.close()
 
         except serial.SerialTimeoutException:
@@ -879,16 +964,36 @@ def run_cli():
     """
     cli_obj = goTennaCLI()
 
-    # connect to goTenna
-    cli_obj.do_sdk_token("<YOUR SDK TOKEN GOES HERE>")
-    cli_obj.do_set_gid("555555555")
-    cli_obj.do_set_geo_region("2") # or 1 in USA
+    import argparse
+    import six
+
+    parser = argparse.ArgumentParser('Run a SMS message goTenna gateway')
+    parser.add_argument('SDK_TOKEN', type=six.b,
+                        help='The token for the goTenna SDK.')
+    parser.add_argument('GEO_REGION', type=six.b,
+                        help='The geo region number you are in.')
+    parser.add_argument('SERIAL_PORT',
+                        help='The serial port of the GSM modem.')
+    parser.add_argument('SERIAL_RATE', type=six.b,
+                        help='The speed of the serial port of the GSM modem.')                        
+    args = parser.parse_args()  
+
+    ## start goTenna SDK thread by setting the SDK token
+    cli_obj.do_sdk_token(args.SDK_TOKEN)
+
+    ## set geo region
+    cli_obj.do_set_geo_region(args.GEO_REGION)
+
+    cli_obj.do_set_gid(SMS_GATEWAY_GID)
+    print("set gid=",SMS_GATEWAY_GID)
+
+    cli_obj.serial_port = args.SERIAL_PORT
+    cli_obj.serial_rate = args.SERIAL_RATE
 
     try:
-        cli_obj.cmdloop("Welcome to the goTenna API sample! "
-                        "Press ? for a command list.\n"
-                        "You must begin by entering an SDK token with the "
-                        "sdk_token command.")
+        sleep(5)
+        cli_obj.cmdloop("Welcome to the SMS Mesh Gateway API sample! "
+                        "Press ? for a command list.\n")
     except Exception: # pylint: disable=broad-except
         traceback.print_exc()
         cli_obj.do_quit('')
