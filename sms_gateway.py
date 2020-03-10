@@ -957,6 +957,7 @@ class goTennaCLI(cmd.Cmd):
             ser.close()
 
         lines = ret.split(b'\r\n')
+        print(ret)
         assert(lines[0] == RETRIEVE_UNREAD)
         assert(lines[-2] == b'OK')
         lines = lines[1:-2] # remove command and 'OK' lines
@@ -982,7 +983,7 @@ class goTennaCLI(cmd.Cmd):
         """
         OPERATE_SMS_MODE = b'AT+CMGF=1\r'
         ENABLE_MODEM = b'AT+CFUN=1\r'
-        DELETE_READ_SENT = 'AT+CMGD=0,2\r' 
+        DELETE_READ_SENT = b'AT+CMGD=0,2\r' 
 
         try:
             ser = serial.Serial(self.serial_port, self.serial_rate, write_timeout=2)
