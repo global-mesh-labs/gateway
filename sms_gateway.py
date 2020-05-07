@@ -874,8 +874,6 @@ class goTennaCLI(cmd.Cmd):
 
         Usage: send_sms PHONE_NUMBER MESSAGE
         """
-        OPERATE_SMS_MODE = b'AT+CMGF=1\r'
-        ENABLE_MODEM = b'AT+CFUN=1\r'
         SEND_SMS = b'AT+CMGS="%b"\r'
         SEND_CLOSE = b'\x1A\r'	#sending CTRL-Z
 
@@ -895,8 +893,6 @@ class goTennaCLI(cmd.Cmd):
                 ser.open()
 
             if ser.is_open:
-                # Set SMS format to text mode
-                self.send_ser_command(ser, OPERATE_SMS_MODE)
                 # send SMS message
                 self.send_ser_command(ser, SEND_SMS % phone_number.encode())
                 self.send_ser_command(ser, message.encode()+SEND_CLOSE)
@@ -928,16 +924,13 @@ class goTennaCLI(cmd.Cmd):
             else:
                 print("\tBroadcasting message from {} to mesh:".format(m['phone_number']))
                 args = str(m['phone_number']+b' '+m['message'], 'utf-8')
-                do_send_broadcast(args)
+                self.do_send_broadcast(args)
 
     def do_read_sms(self, args, callback=None):
         """ Read all unread SMS messages received.
 
         Usage: read_sms
         """
-        OPERATE_SMS_MODE = b'AT+CMGF=1\r'
-        ENABLE_MODEM = b'AT+CFUN=1\r'
-        SMS_STORAGE = b'AT+CPMS="MT","MT","MT"\r'
         RETRIEVE_UNREAD = b'AT+CMGL="REC UNREAD"\r'
 
         try:
@@ -947,8 +940,6 @@ class goTennaCLI(cmd.Cmd):
                 ser.open()
 
             if ser.is_open:
-                # Set SMS format to text mode
-                self.send_ser_command(ser, OPERATE_SMS_MODE)
                 # retrieve all unread SMS messages
                 ret = self.send_ser_command(ser, RETRIEVE_UNREAD)
                 ser.close()
@@ -957,7 +948,6 @@ class goTennaCLI(cmd.Cmd):
             ser.close()
 
         lines = ret.split(b'\r\n')
-        print(ret)
         assert(lines[0] == RETRIEVE_UNREAD)
         assert(lines[-2] == b'OK')
         lines = lines[1:-2] # remove command and 'OK' lines
@@ -981,8 +971,6 @@ class goTennaCLI(cmd.Cmd):
 
         Usage: delete_sms
         """
-        OPERATE_SMS_MODE = b'AT+CMGF=1\r'
-        ENABLE_MODEM = b'AT+CFUN=1\r'
         DELETE_READ_SENT = b'AT+CMGD=0,2\r' 
 
         try:
@@ -994,10 +982,40 @@ class goTennaCLI(cmd.Cmd):
                 ser.open()
 
             if ser.is_open:
-                # Set SMS format to text mode
-                self.send_ser_command(ser, OPERATE_SMS_MODE)
                 # delete all read and sent messages
                 self.send_ser_command(ser, DELETE_READ_SENT)
+                ser.close()
+
+        except serial.SerialTimeoutException:
+            ser.close()
+
+    def do_init_sms(self, args):
+        """ Initialize the SMS Modem once when program launched
+
+        Usage: init_sms
+        """
+        OPERATE_SMS_MODE = b'AT+CMGF=1\r'
+        ECHO_MODE = b'ATE1\r'
+        ENABLE_MODEM = b'AT+CFUN=1\r' 
+        SMS_STORAGE = b'AT+CPMS="MT","MT","MT"\r'
+
+        try:
+            ser = serial.Serial(self.serial_port, self.serial_rate, write_timeout=2)
+            
+            print("Initializing the SMS modem.")
+
+            if not ser.is_open:
+                ser.open()
+
+            if ser.is_open:
+                # Set SMS format to text mode
+                self.send_ser_command(ser, OPERATE_SMS_MODE)
+                # Set echo mode
+                self.send_ser_command(ser, ECHO_MODE)
+                # Make sure modem is enabled
+                self.send_ser_command(ser, ENABLE_MODEM)
+                # Store SMS messages received on the modem
+                self.send_ser_command(ser, SMS_STORAGE)
                 ser.close()
 
         except serial.SerialTimeoutException:
@@ -1035,6 +1053,8 @@ def run_cli():
 
     cli_obj.serial_port = args.SERIAL_PORT
     cli_obj.serial_rate = args.SERIAL_RATE
+    cli_obj.do_init_sms("")
+    cli_obj.do_delete_sms("")
 
     try:
         sleep(5)
