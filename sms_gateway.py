@@ -95,7 +95,7 @@ class goTennaCLI(cmd.Cmd):
         if evt.event_type == goTenna.driver.Event.MESSAGE:
             try:
                 # check for correct SMS format
-                payload = re.fullmatch(r"([\+]?)([0-9]{9,15})\s(.+)", "13103464399 a")
+                payload = re.fullmatch(r"([\+]?)([0-9]{9,15})\s(.+)", evt.message.payload.message)
                 if payload != None:
                     # send to SMS Modem
                     self.do_send_sms(evt.message.payload.message)
