@@ -12,6 +12,14 @@ import goTenna # The goTenna API
 import re
 import serial
 from time import sleep
+import cbor
+
+BYTE_STRING_CBOR_TAG = 24
+PHONE_NUMBER_CBOR_TAG = 25
+MESSAGE_TEXT_CBOR_TAG = 26
+BITCOIN_NETWORK_CBOR_TAG = 27
+SEGMENT_NUMBER_CBOR_TAG = 28
+SEGMENT_COUNT_CBOR_TAG = 29
 
 # For SPI connection only, set SPI_CONNECTION to true with proper SPI settings
 SPI_CONNECTION = False
@@ -94,15 +102,36 @@ class goTennaCLI(cmd.Cmd):
         """
         if evt.event_type == goTenna.driver.Event.MESSAGE:
             try:
-                # check for correct SMS format
-                payload = re.fullmatch(r"([\+]?)([0-9]{9,15})\s(.+)", evt.message.payload.message)
-                if payload != None:
-                    # send to SMS Modem
-                    self.do_send_sms(evt.message.payload.message)
-                    
-                    # keep track of mapping of sms destination to mesh sender
-                    phone_number = payload[2]
-                    self.sms_sender_dict[phone_number.encode()] = str(evt.message.sender.gid_val).encode()
+                if type(evt.message.payload) == goTenna.payload.BinaryPayload:
+                    protocol_msg = cbor.loads(evt.message.payload._binary_data)
+                    if PHONE_NUMBER_CBOR_TAG in protocol_msg:
+                        phone_number = str(protocol_msg[PHONE_NUMBER_CBOR_TAG])
+                        text_message = protocol_msg[MESSAGE_TEXT_CBOR_TAG]
+                        self.do_send_sms("+" + phone_number + " " + text_message)
+                        self.sms_sender_dict[phone_number.encode()] = str(evt.message.sender.gid_val).encode()
+                    elif BITCOIN_NETWORK_CBOR_TAG in protocol_msg:
+                        index = protocol_msg[SEGMENT_NUMBER_CBOR_TAG]
+                        count = protocol_msg[SEGMENT_COUNT_CBOR_TAG]
+                        data = protocol_msg[BYTE_STRING_CBOR_TAG]
+                        print("index=" + str(index) + ", count=" + str(count) + " data: ")
+                        print(''.join('{:02x}'.format(x) for x in data))
+                        # TODO: 1a) concatonate segments and send as new transaction to block explorer 
+                        # TODO: 1b) send acknowledgement back to Signal Mesh as a text message
+                        # TODO: 2a) monitor for transaction to be confirmed in a block
+                        # TODO: 2b) send blockchain confirmation back to Signal Mesh as a text message
+                    else:
+                        print("Unknown BinaryPayload.")
+                else:
+                    # check for correct (legacy) text SMS format
+                    parsed_payload = re.fullmatch(r"([\+]?)([0-9]{9,15})\s(.+)", evt.message.payload.message)
+                    if parsed_payload != None:
+                        phone_number = parsed_payload[2]
+                        text_message = parsed_payload[3]
+                        # send to SMS Modem
+                        self.do_send_sms("+" + phone_number + " " + text_message)
+                        
+                        # keep track of mapping of sms destination to mesh sender
+                        self.sms_sender_dict[phone_number.encode()] = str(evt.message.sender.gid_val).encode()
 
             except Exception: # pylint: disable=broad-except
                 traceback.print_exc()
