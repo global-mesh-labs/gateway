@@ -1,6 +1,6 @@
-""" sample.py - A example of using the goTenna API for a simple command line messaging application.
+""" sms_gateway.py - A example of using the goTenna API for a simple command line messaging application.
 
-Usage: python sample.py
+Usage: python sms_gateway.py
 """
 from __future__ import print_function
 import cmd # for the command line application
@@ -13,13 +13,12 @@ import re
 import serial
 from time import sleep
 import cbor
+from txtenna import TxTenna
 
-BYTE_STRING_CBOR_TAG = 24
 PHONE_NUMBER_CBOR_TAG = 25
 MESSAGE_TEXT_CBOR_TAG = 26
-BITCOIN_NETWORK_CBOR_TAG = 27
-SEGMENT_NUMBER_CBOR_TAG = 28
-SEGMENT_COUNT_CBOR_TAG = 29
+TXTENNA_ID_CBOR_TAG = 30
+TRANSACTION_HASH_CBOR_TAG = 31
 
 # For SPI connection only, set SPI_CONNECTION to true with proper SPI settings
 SPI_CONNECTION = False
@@ -39,7 +38,7 @@ try:
 except ImportError:
     pass
 
-SMS_GATEWAY_GID = "555555555"
+GATEWAY_GID = "555555555"
 
 class goTennaCLI(cmd.Cmd):
     """ CLI handler function
@@ -62,6 +61,7 @@ class goTennaCLI(cmd.Cmd):
         self.serial_port = None
         self.serial_rate = 115200
         self.sms_sender_dict = {}
+        self.txtenna = None
 
     def precmd(self, line):
         if not self.api_thread\
@@ -109,18 +109,15 @@ class goTennaCLI(cmd.Cmd):
                         text_message = protocol_msg[MESSAGE_TEXT_CBOR_TAG]
                         self.do_send_sms("+" + phone_number + " " + text_message)
                         self.sms_sender_dict[phone_number.encode()] = str(evt.message.sender.gid_val).encode()
-                    elif BITCOIN_NETWORK_CBOR_TAG in protocol_msg:
-                        index = protocol_msg[SEGMENT_NUMBER_CBOR_TAG]
-                        count = protocol_msg[SEGMENT_COUNT_CBOR_TAG]
-                        data = protocol_msg[BYTE_STRING_CBOR_TAG]
-                        print("index=" + str(index) + ", count=" + str(count) + " data: ")
-                        print(''.join('{:02x}'.format(x) for x in data))
-                        # TODO: 1a) concatonate segments and send as new transaction to block explorer 
-                        # TODO: 1b) send acknowledgement back to Signal Mesh as a text message
-                        # TODO: 2a) monitor for transaction to be confirmed in a block
-                        # TODO: 2b) send blockchain confirmation back to Signal Mesh as a text message
+                    elif TXTENNA_ID_CBOR_TAG in protocol_msg or TRANSACTION_HASH_CBOR_TAG in protocol_msg:
+                        if self.txtenna != None:
+                            self.txtenna.handle_cbor_message(evt.message.sender.gid_val, protocol_msg)
+                        else:
+                            print("TxTenna BinaryPayload received but ignored.")
                     else:
                         print("Unknown BinaryPayload.")
+                elif type(evt.message.payload) == goTenna.payload.CustomPayload:
+                    print("Unknown CustomPayload.")
                 else:
                     # check for correct (legacy) text SMS format
                     parsed_payload = re.fullmatch(r"([\+]?)([0-9]{9,15})\s(.+)", evt.message.payload.message)
@@ -374,7 +371,8 @@ class goTennaCLI(cmd.Cmd):
         # pylint: disable=unused-argument
         if self.api_thread:
             self.api_thread.join()
-        sys.exit()
+
+        return True
 
     def do_echo(self, rem):
         """ Send an echo command
@@ -424,86 +422,6 @@ class goTennaCLI(cmd.Cmd):
                 print("Message too long!")
                 return
             self.in_flight_events[corr_id.bytes] = 'Broadcast message: {}'.format(message)
-
-    def do_send_emergency(self, message):
-        """ Send an emergency message
-
-        Usage: send_emergency MESSAGE
-        """
-        if not self.api_thread.connected:
-            print("No device connected")
-        else:
-            def error_handler(details):
-                """ A special error handler for formatting message failures
-                """
-                if details['code'] in [goTenna.constants.ErrorCodes.TIMEOUT,
-                                       goTenna.constants.ErrorCodes.OSERROR]:
-                    return "Message may not have been sent: USB connection disrupted"
-                return "Error sending message: {}".format(details)
-
-            try:
-                method_callback = self.build_callback(error_handler)
-                payload = goTenna.payload.TextPayload(message)
-                corr_id = self.api_thread.send_emergency(payload,
-                                                         method_callback)
-            except ValueError:
-                print("Message too long!")
-                return
-            self.in_flight_events[corr_id.bytes] = 'Emergency message: {}'.format(message)
-
-    def do_set_emergency_message(self, message):
-        """ Set an emergency message. This message will be used when enabling the emergency beacon.
-
-        Usage: set_emergency MESSAGE
-
-        """
-        if not self.api_thread.connected:
-            print("No device connected")
-        else:
-            def error_handler(details):
-                """ A special error handler for formatting message failures
-                """
-                if details['code'] in [goTenna.constants.ErrorCodes.TIMEOUT,
-                                       goTenna.constants.ErrorCodes.OSERROR]:
-                    return "Message may not have been sent: USB connection disrupted"
-                return "Error sending message: {}".format(details)
-
-            try:
-                method_callback = self.build_callback(error_handler)
-                payload = goTenna.payload.TextPayload(message)
-                corr_id = self.api_thread.set_emergency_message(payload,
-                                                                method_callback)
-            except ValueError:
-                print("Message too long!")
-                return
-            self.in_flight_events[corr_id.bytes] = 'Set emergency message: {}'.format(message)
-
-    def do_set_emergency_beacon(self, enabled):
-        """ Enable or disable an emergency beacon
-
-        Usage: 
-            enable emergency beacon: set_emergency_beacon 1
-            disable emergency beacon: set_emergency_beacon 0
-        """
-        if not self.api_thread.connected:
-            print("No device connected")
-        else:
-            def error_handler(details):
-                """ A special error handler for formatting message failures
-                """
-                if details['code'] in [goTenna.constants.ErrorCodes.TIMEOUT,
-                                       goTenna.constants.ErrorCodes.OSERROR]:
-                    return "Message may not have been sent: USB connection disrupted"
-                return "Error sending message: {}".format(details)
-
-            try:
-                method_callback = self.build_callback(error_handler)
-                corr_id = self.api_thread.set_emergency_beacon(enabled,
-                                                               method_callback)
-            except:
-                print("Error settting emrgency beacon!")
-                return
-            self.in_flight_events[corr_id.bytes] = 'Emergency beacon: {}'.format(enabled)
 
     @staticmethod
     def _parse_gid(line, gid_type, print_message=True):
@@ -1050,13 +968,20 @@ class goTennaCLI(cmd.Cmd):
         except serial.SerialTimeoutException:
             ser.close()
 
+'''
+    class to add TxTenna functionality to SMS gateway
+'''
+class goTennaCLI_TxTenna(goTennaCLI, TxTenna):
+    def __init__(self, local_gid, local, send_dir, receive_dir, pipe):
+        goTennaCLI.__init__(self)
+        TxTenna.__init__(self, local_gid, local, send_dir, receive_dir, pipe)
+    pass
+
 def run_cli():
     """ The main function of the sample app.
 
     Instantiates a CLI object and runs it.
     """
-    cli_obj = goTennaCLI()
-
     import argparse
     import six
 
@@ -1068,8 +993,28 @@ def run_cli():
     parser.add_argument('SERIAL_PORT',
                         help='The serial port of the GSM modem.')
     parser.add_argument('SERIAL_RATE', type=six.b,
-                        help='The speed of the serial port of the GSM modem.')                        
+                        help='The speed of the serial port of the GSM modem.')
+    
+    # TxTenna parameters
+    parser.add_argument("--gateway", action="store_true",
+                        help="Use this computer as an internet connected transaction gateway with a default GID")
+    parser.add_argument("--local", action="store_true",
+                        help="Use local bitcoind to confirm and broadcast transactions")
+    parser.add_argument("--send_dir",
+                        help="Broadcast message data from files in this directory")
+    parser.add_argument("--receive_dir",
+                        help="Write files from received message data in this directory")
+    parser.add_argument('-p', '--pipe',
+                        default='/tmp/blocksat/api',
+                        help='Pipe on which relayed message data is written out to ' +
+                        '(default: /tmp/blocksat/api)')                       
     args = parser.parse_args()  
+
+    if (args.gateway):
+        cli_obj = goTennaCLI_TxTenna(GATEWAY_GID, args.local, args.send_dir, args.receive_dir, args.pipe)
+        cli_obj.txtenna = cli_obj
+    else:
+        cli_obj = goTennaCLI()
 
     ## start goTenna SDK thread by setting the SDK token
     cli_obj.do_sdk_token(args.SDK_TOKEN)
@@ -1077,8 +1022,8 @@ def run_cli():
     ## set geo region
     cli_obj.do_set_geo_region(args.GEO_REGION)
 
-    cli_obj.do_set_gid(SMS_GATEWAY_GID)
-    print("set gid=",SMS_GATEWAY_GID)
+    cli_obj.do_set_gid(GATEWAY_GID)
+    print("set gid=",GATEWAY_GID)
 
     cli_obj.serial_port = args.SERIAL_PORT
     cli_obj.serial_rate = args.SERIAL_RATE
