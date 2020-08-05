@@ -14,6 +14,7 @@ import serial
 from time import sleep
 import cbor
 from txtenna import TxTenna
+import threading
 
 PHONE_NUMBER_CBOR_TAG = 25
 MESSAGE_TEXT_CBOR_TAG = 26
@@ -56,12 +57,16 @@ class goTennaCLI(cmd.Cmd):
         self._settings = goTenna.settings.GoTennaSettings(
             rf_settings=goTenna.settings.RFSettings(), 
             geo_settings=goTenna.settings.GeoSettings())
-        self._do_encryption = True
+        self._do_encryption = False
         self._awaiting_disconnect_after_fw_update = [False]
         self.serial_port = None
         self.serial_rate = 115200
         self.sms_sender_dict = {}
         self.txtenna = None
+        self.serial = None
+
+        # prevent threads from accessing serial port simultaneiously
+        self.serial_lock = threading.Lock() 
 
     def precmd(self, line):
         if not self.api_thread\
@@ -160,8 +165,10 @@ class goTennaCLI(cmd.Cmd):
                 self._set_bandwidth = False
         elif evt.event_type == goTenna.driver.Event.STATUS:
             self.status = evt.status
-            # check for unread SMS messages
-            self.do_read_sms("", self.forward_to_mesh)
+            if self.serial != None:
+                # check for unread SMS messages
+                self.do_read_sms("", self.forward_to_mesh)
+
         elif evt.event_type == goTenna.driver.Event.GROUP_CREATE:
             index = -1
             for idx, member in enumerate(evt.group.members):
@@ -363,6 +370,21 @@ class goTennaCLI(cmd.Cmd):
         self.in_flight_events[corr_id.bytes] = 'Group removing of {}' \
             .format(group_gid.gid_val)
 
+    def preloop(self):
+        """Initialization before prompting user for commands.
+           Despite the claims in the Cmd documentaion, Cmd.preloop() is not a stub.
+        """
+        cmd.Cmd.preloop(self)   ## sets up command completion
+        self._hist    = []      ## No history yet
+        self._locals  = {}      ## Initialize execution namespace for user
+        self._globals = {}
+        
+        if self.serial_port != None:
+            self.do_init_sms("")
+
+        if self.serial != None:
+            self.do_delete_sms("")
+
     def do_quit(self, arg):
         """ Safely quit.
 
@@ -371,6 +393,9 @@ class goTennaCLI(cmd.Cmd):
         # pylint: disable=unused-argument
         if self.api_thread:
             self.api_thread.join()
+        if self.serial and self.serial.is_open:
+            self.serial.close()
+            self.serial = None
 
         return True
 
@@ -800,21 +825,21 @@ class goTennaCLI(cmd.Cmd):
             print("Device must be connected")
         print(self.api_thread.system_info)
 
-    def send_ser_command(self, ser, command):
-            ser.write(command)
-            sleep(0.2)
-            ret = b''
-            n = ser.in_waiting
-            while True:
-                if n > 0:
-                    ret += ser.read(n)
-                else:
-                    sleep(.2)
-                n = ser.in_waiting
-                if n == 0:
-                   break
+    def send_ser_command(self, command):
+        self.serial.write(command)
+        sleep(0.5)
+        ret = b''
+        n = self.serial.in_waiting
+        while True:
+            if n > 0:
+                ret += self.serial.read(n)
+            else:
+                sleep(.5)
+            n = self.serial.in_waiting
+            if n == 0:
+                break
 
-            return ret
+        return ret
 
     def do_send_sms(self, args):
         """ Send an SMS message to a particular phone number.
@@ -825,7 +850,6 @@ class goTennaCLI(cmd.Cmd):
         SEND_CLOSE = b'\x1A\r'	#sending CTRL-Z
 
         try:
-            ser = serial.Serial(self.serial_port, self.serial_rate, write_timeout=2)
 
             # zero or one '+', 9-15 digit phone number,whitespace,message text of 1-n characters
             payload = re.fullmatch(r"([\+]?)([0-9]{9,15})\s(.+)", args)
@@ -836,17 +860,13 @@ class goTennaCLI(cmd.Cmd):
             print("Sending SMS to {}".format(phone_number))
             print ("Message: ", message)
 
-            if not ser.is_open:
-                ser.open()
-
-            if ser.is_open:
+            with self.serial_lock:
                 # send SMS message
-                self.send_ser_command(ser, SEND_SMS % phone_number.encode())
-                self.send_ser_command(ser, message.encode()+SEND_CLOSE)
-                ser.close()
+                self.send_ser_command(SEND_SMS % phone_number.encode())
+                self.send_ser_command(message.encode()+SEND_CLOSE)
 
         except serial.SerialTimeoutException:
-            ser.close()
+            print("SerialTimeoutException")
 
     def print_messages(self, msgs):
 
@@ -879,39 +899,35 @@ class goTennaCLI(cmd.Cmd):
         Usage: read_sms
         """
         RETRIEVE_UNREAD = b'AT+CMGL="REC UNREAD"\r'
+        msgs = []
 
         try:
-            ser = serial.Serial(self.serial_port, self.serial_rate, write_timeout=2)
-
-            if not ser.is_open:
-                ser.open()
-
-            if ser.is_open:
+            with self.serial_lock:
                 # retrieve all unread SMS messages
-                ret = self.send_ser_command(ser, RETRIEVE_UNREAD)
-                ser.close()
+                ret = self.send_ser_command(RETRIEVE_UNREAD)
 
         except serial.SerialTimeoutException:
-            ser.close()
+            print("SerialTimeoutException")
 
-        lines = ret.split(b'\r\n')
-        assert(lines[0] == RETRIEVE_UNREAD)
-        assert(lines[-2] == b'OK')
-        lines = lines[1:-2] # remove command and 'OK' lines
-        msgs = []
-        if len(lines) >= 3:
-            for n in range(0, len(lines), 3):
-                #print items
-                fields = lines[n].split(b",")
-                phone_number = fields[2].strip(b'"')
-                received = fields[4].strip(b'"')
-                message = lines[n+1]
-                msgs.append({'phone_number':phone_number, 'received':received, 'message':message})
+        lines = [line for line in ret.split(b'\r\n') if line.strip() != b'']
 
-        if len(msgs) > 0 and callback != None:
-            callback(msgs)
+        if len(lines) == 0 or lines[0] != RETRIEVE_UNREAD:
+            return
 
-        return
+        if len(lines) >= 2:
+            for n in range(1, len(lines), 2):
+                if lines[n] != b'OK':
+                    fields = lines[n].split(b",")
+                    phone_number = fields[2].strip(b'"')
+                    received = fields[4].strip(b'"')
+                    message = lines[n+1]
+                    msgs.append({'phone_number':phone_number, 'received':received, 'message':message})
+
+        if len(msgs) > 0:
+            if callback != None:
+                callback(msgs)
+            else:
+                print(msgs)
 
     def do_delete_sms(self, args):
         """ Delete all read and sent SMS messages from phone storage.
@@ -921,52 +937,47 @@ class goTennaCLI(cmd.Cmd):
         DELETE_READ_SENT = b'AT+CMGD=0,2\r' 
 
         try:
-            ser = serial.Serial(self.serial_port, self.serial_rate, write_timeout=2)
-            
             print("Deleting all read and sent SMS messages.")
 
-            if not ser.is_open:
-                ser.open()
-
-            if ser.is_open:
+            with self.serial_lock:
                 # delete all read and sent messages
-                self.send_ser_command(ser, DELETE_READ_SENT)
-                ser.close()
+                self.send_ser_command(DELETE_READ_SENT)
 
         except serial.SerialTimeoutException:
-            ser.close()
+            sprint("SerialTimeoutException")
 
     def do_init_sms(self, args):
         """ Initialize the SMS Modem once when program launched
 
         Usage: init_sms
         """
+
+        if self.serial == None:
+            self.serial = serial.Serial(self.serial_port, self.serial_rate, write_timeout=2)
+
         OPERATE_SMS_MODE = b'AT+CMGF=1\r'
         ECHO_MODE = b'ATE1\r'
         ENABLE_MODEM = b'AT+CFUN=1\r' 
         SMS_STORAGE = b'AT+CPMS="MT","MT","MT"\r'
+        NO_MESSAGE_INDICATORS = b'AT+CNMI=2,0,0,0,0\r'
 
         try:
-            ser = serial.Serial(self.serial_port, self.serial_rate, write_timeout=2)
-            
             print("Initializing the SMS modem.")
 
-            if not ser.is_open:
-                ser.open()
-
-            if ser.is_open:
+            with self.serial_lock:
                 # Set SMS format to text mode
-                self.send_ser_command(ser, OPERATE_SMS_MODE)
+                self.send_ser_command(OPERATE_SMS_MODE)
                 # Set echo mode
-                self.send_ser_command(ser, ECHO_MODE)
+                self.send_ser_command(ECHO_MODE)
                 # Make sure modem is enabled
-                self.send_ser_command(ser, ENABLE_MODEM)
+                self.send_ser_command(ENABLE_MODEM)
                 # Store SMS messages received on the modem
-                self.send_ser_command(ser, SMS_STORAGE)
-                ser.close()
+                self.send_ser_command(SMS_STORAGE)
+                # Disable unsolicited message indicators
+                self.send_ser_command(NO_MESSAGE_INDICATORS)
 
         except serial.SerialTimeoutException:
-            ser.close()
+            print("SerialTimeoutException")
 
 '''
     class to add TxTenna functionality to SMS gateway
@@ -1013,6 +1024,7 @@ def run_cli():
     if (args.gateway):
         cli_obj = goTennaCLI_TxTenna(GATEWAY_GID, args.local, args.send_dir, args.receive_dir, args.pipe)
         cli_obj.txtenna = cli_obj
+
     else:
         cli_obj = goTennaCLI()
 
@@ -1027,8 +1039,6 @@ def run_cli():
 
     cli_obj.serial_port = args.SERIAL_PORT
     cli_obj.serial_rate = args.SERIAL_RATE
-    cli_obj.do_init_sms("")
-    cli_obj.do_delete_sms("")
 
     try:
         sleep(5)
