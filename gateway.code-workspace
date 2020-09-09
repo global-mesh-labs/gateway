@@ -1,0 +1,16 @@
+{
+	"folders": [
+		{
+			"path": "."
+		},
+		{
+			"path": "../../../VSCode/txtenna-python"
+		},
+		{
+			"path": "../../../VSCode/go/lnd"
+		}
+	],
+	"settings": {
+		"python.pythonPath": ".venv/bin/python"
+	}
+}

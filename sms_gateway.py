@@ -8,18 +8,29 @@ import sys # To quit
 import os
 import traceback
 import logging
+import math
 import goTenna # The goTenna API
 import re
 import serial
+import time
 from time import sleep
 import cbor
 from txtenna import TxTenna
 import threading
+import socket
+import select
 
+BYTE_STRING_CBOR_TAG = 24
 PHONE_NUMBER_CBOR_TAG = 25
 MESSAGE_TEXT_CBOR_TAG = 26
+SEGMENT_NUMBER_CBOR_TAG = 28
+SEGMENT_COUNT_CBOR_TAG = 29
 TXTENNA_ID_CBOR_TAG = 30
 TRANSACTION_HASH_CBOR_TAG = 31
+TXID_CBOR_TAG = 31
+HOST_CBOR_TAG = 32
+PORT_CBOR_TAG = 33
+SOCKET_ID_CBOR_TAG = 34
 
 # For SPI connection only, set SPI_CONNECTION to true with proper SPI settings
 SPI_CONNECTION = False
@@ -27,6 +38,10 @@ SPI_BUS_NO = 0
 SPI_CHIP_NO = 0
 SPI_REQUEST = 22
 SPI_READY = 27
+
+# For socket connections
+DEFAULT_BUF_SIZE = 6000
+MESH_PAYLOAD_SIZE = 150
 
 # Configure the Python logging module to print to stderr. In your application,
 # you may want to route the logging elsewhere.
@@ -40,6 +55,169 @@ except ImportError:
     pass
 
 GATEWAY_GID = "555555555"
+in_flight_events = {}
+
+def mesh_socket_write(data, index, count, api_thread, gid, socket_id, in_flight_events):
+    if api_thread is None or api_thread.connect is False:
+        return None
+
+    offset = index * MESH_PAYLOAD_SIZE
+    end = min([offset+MESH_PAYLOAD_SIZE, len(data)])
+
+    print("Private (socket) {} of {} messages to {}: socket {}, length = {}."
+        .format(index, count, gid, socket_id, len(data[offset:end])))
+
+    d = {
+        SOCKET_ID_CBOR_TAG : socket_id,
+        SEGMENT_NUMBER_CBOR_TAG : index,
+        SEGMENT_COUNT_CBOR_TAG : count,
+        BYTE_STRING_CBOR_TAG : data[offset:end]
+    }
+    protocol_msg = cbor.dumps(d)
+    # print("socket_id: {}, data: {}".format(socket_id.hex(), data.decode('utf-8')))
+
+    try:
+        method_callback = build_callback(in_flight_events)
+        payload = goTenna.payload.BinaryPayload(protocol_msg)
+        payload.set_sender_initials('f')
+        def ack_callback(correlation_id, success):
+            if success:
+                print("Private (socket) message: delivery confirmed")
+            else:
+                print("Private (socket) message: delivery not confirmed, recipient may be offline or out of range")
+        gidobj = goTenna.settings.GID(int(gid), goTenna.settings.GID.PRIVATE)
+
+        corr_id = None
+        attempts = 0
+        while corr_id is None and attempts < 5:
+            corr_id = api_thread.send_private(gidobj, payload,
+                                                    method_callback,
+                                                    ack_callback=ack_callback,
+                                                    encrypt=False)
+            if corr_id is None:
+                attempts += 1
+                sleep(20)
+    except ValueError:
+        print("Message too long!")
+        return
+
+    if corr_id is not None:
+        in_flight_events[corr_id.bytes]\
+            = 'Private message to {}: socket_id:{}, index:{}, count:{}'.format(gid, socket_id.hex(), index, count)
+    else:
+        print("corr_id is None!")
+
+    return corr_id
+
+def build_callback(in_flight_events, error_handler=None):
+    """ Build a callback for sending to the API thread. May speciy a callable
+    error_handler(details) taking the error details from the callback. The handler should return a string.
+    """
+    def default_error_handler(details):
+        """ Easy error handler if no special behavior is needed. Just builds a string with the error.
+        """
+        if details['code'] in [goTenna.constants.ErrorCodes.TIMEOUT,
+                                goTenna.constants.ErrorCodes.OSERROR,
+                                goTenna.constants.ErrorCodes.EXCEPTION]:
+            return "USB connection disrupted"
+        return "Error: {}: {}".format(details['code'], details['msg'])
+
+    # Define a second function here so it implicitly captures self
+    captured_error_handler = [error_handler]
+    def callback(correlation_id, success=None, results=None,
+                    error=None, details=None):
+        """ The default callback to pass to the API.
+
+        See the documentation for ``goTenna.driver``.
+
+        Does nothing but print whether the method succeeded or failed.
+        """
+        method = in_flight_events.pop(correlation_id.bytes, 'Method call')
+        if success:
+            if results:
+                print("{} succeeded: {}".format(method, results))
+            else:
+                print("{} succeeded!".format(method))
+        elif error:
+            if not captured_error_handler[0]:
+                captured_error_handler[0] = default_error_handler
+            print("{} failed: {}".format(method, captured_error_handler[0](details)))
+    return callback
+
+class MeshSocket:
+    """demonstration class only
+      - coded for clarity, not efficiency
+    """
+
+    def __init__(self, api_thread, gid, socket_id, in_flight_events):
+        self.api_thread = api_thread
+        self.gid = gid
+        self.socket_id = socket_id
+        self.socket_thread = None
+        self.mesh_thread = None
+        self.in_flight_events = in_flight_events
+        self.buffer = b''
+        self.write_to_mesh_queue=[]
+        self.running = False
+
+    def connect(self, host, port):
+        self.sock = socket.create_connection((host, port))
+        self.sock.setblocking(0)
+
+    def socket_send(self, data, index, count):
+        print("Received (socket) {} of {} messages from {}: socket {}, length = {}".
+            format(index, count, self.gid, self.socket_id, len(data)))
+        self.buffer = self.buffer + data
+        if index == count - 1:
+            totalsent = 0
+            while totalsent < len(self.buffer):
+                sent = self.sock.send(self.buffer[totalsent:])
+                if sent == 0:
+                    raise RuntimeError("socket connection broken")
+                totalsent = totalsent + sent
+            self.buffer = b''
+
+    def readytoread(self):
+        ready_to_read, ready_to_write, in_error = \
+               select.select([self.sock],[],[])
+        return self.sock in ready_to_read 
+    
+    def run(self):
+        self.socket_thread = threading.Thread(target=self.read_socket_thread, args=())
+        self.mesh_thread = threading.Thread(target=self.write_mesh_thread, args=())
+        self.running = True
+        self.socket_thread.start()
+        self.mesh_thread.start()
+
+    def read_socket_thread(self):
+        timeout = 0
+        while self.running:
+            try:
+                data = self.sock.recv(DEFAULT_BUF_SIZE)
+            except BlockingIOError:
+                sleep(1)
+                continue
+            except ConnectionResetError:
+                print("MeshSocket: run_thread(), ConnectionResetError.")
+                self.running = False
+                break
+            if data != b'':
+                self.write_to_mesh_queue.append(data)
+                timeout = 0
+            else:
+                sleep(1)
+                timeout += 1
+
+    def write_mesh_thread(self):
+        while self.running:
+            if (len(self.write_to_mesh_queue) > 0):
+                data = self.write_to_mesh_queue.pop()
+                count = int(math.ceil(len(data) / MESH_PAYLOAD_SIZE))
+                for index in range(0, count) :
+                    # blocks if data rate is exceeded 
+                    mesh_socket_write(data, index, count, self.api_thread, self.gid, self.socket_id, self.in_flight_events)
+            else:
+                sleep(1)
 
 class goTennaCLI(cmd.Cmd):
     """ CLI handler function
@@ -64,6 +242,8 @@ class goTennaCLI(cmd.Cmd):
         self.sms_sender_dict = {}
         self.txtenna = None
         self.serial = None
+
+        self.socket_dict = {}
 
         # prevent threads from accessing serial port simultaneiously
         self.serial_lock = threading.Lock() 
@@ -114,11 +294,38 @@ class goTennaCLI(cmd.Cmd):
                         text_message = protocol_msg[MESSAGE_TEXT_CBOR_TAG]
                         self.do_send_sms("+" + phone_number + " " + text_message)
                         self.sms_sender_dict[phone_number.encode()] = str(evt.message.sender.gid_val).encode()
-                    elif TXTENNA_ID_CBOR_TAG in protocol_msg or TRANSACTION_HASH_CBOR_TAG in protocol_msg:
+                    elif TXTENNA_ID_CBOR_TAG in protocol_msg:
                         if self.txtenna != None:
                             self.txtenna.handle_cbor_message(evt.message.sender.gid_val, protocol_msg)
                         else:
                             print("TxTenna BinaryPayload received but ignored.")
+                    elif HOST_CBOR_TAG in protocol_msg and PORT_CBOR_TAG in protocol_msg and SOCKET_ID_CBOR_TAG in protocol_msg:
+                        host = protocol_msg[HOST_CBOR_TAG]
+                        port = protocol_msg[PORT_CBOR_TAG]
+                        socket_id = protocol_msg[SOCKET_ID_CBOR_TAG]
+                        gid = str(evt.message.sender.gid_val).encode()
+                        count = protocol_msg[SEGMENT_COUNT_CBOR_TAG]
+
+                        if socket_id not in self.socket_dict or self.socket_dict[socket_id].running == False:
+                            self.socket_dict[socket_id] = MeshSocket(self.api_thread, gid, socket_id, self.in_flight_events)
+                            try:
+                                self.socket_dict[socket_id].connect(host, port)
+                            except ConnectionRefusedError:
+                                self.socket_dict[socket_id].send_private(b'')
+                                return
+                            self.socket_dict[socket_id].run()
+
+                        if BYTE_STRING_CBOR_TAG in protocol_msg:
+                            data = protocol_msg[BYTE_STRING_CBOR_TAG]
+                            self.socket_dict[socket_id].socket_send(data, 0, count)
+
+                    elif BYTE_STRING_CBOR_TAG in protocol_msg and SOCKET_ID_CBOR_TAG in protocol_msg:
+                        socket_id = protocol_msg[SOCKET_ID_CBOR_TAG]
+                        if socket_id in self.socket_dict:
+                            data = protocol_msg[BYTE_STRING_CBOR_TAG]
+                            count = protocol_msg[SEGMENT_COUNT_CBOR_TAG]
+                            index = protocol_msg[SEGMENT_NUMBER_CBOR_TAG]
+                            self.socket_dict[socket_id].socket_send(data, index, count)
                     else:
                         print("Unknown BinaryPayload.")
                 elif type(evt.message.payload) == goTenna.payload.CustomPayload:
@@ -134,7 +341,12 @@ class goTennaCLI(cmd.Cmd):
                         
                         # keep track of mapping of sms destination to mesh sender
                         self.sms_sender_dict[phone_number.encode()] = str(evt.message.sender.gid_val).encode()
-
+            except BrokenPipeError:
+                self.socket_dict.pop(socket_id)
+            except ConnectionResetError:
+                self.socket_dict.pop(socket_id)
+            except ConnectionRefusedError:
+                self.socket_dict.pop(socket_id)
             except Exception: # pylint: disable=broad-except
                 traceback.print_exc()
         elif evt.event_type == goTenna.driver.Event.DEVICE_PRESENT:
@@ -178,42 +390,6 @@ class goTennaCLI(cmd.Cmd):
             print("Added to group {}: You are member {}"
                   .format(evt.group.gid.gid_val,
                           index))
-
-    def build_callback(self, error_handler=None):
-        """ Build a callback for sending to the API thread. May speciy a callable
-        error_handler(details) taking the error details from the callback. The handler should return a string.
-        """
-        def default_error_handler(details):
-            """ Easy error handler if no special behavior is needed. Just builds a string with the error.
-            """
-            if details['code'] in [goTenna.constants.ErrorCodes.TIMEOUT,
-                                   goTenna.constants.ErrorCodes.OSERROR,
-                                   goTenna.constants.ErrorCodes.EXCEPTION]:
-                return "USB connection disrupted"
-            return "Error: {}: {}".format(details['code'], details['msg'])
-        # Define a second function here so it implicitly captures self
-        captured_error_handler = [error_handler]
-        def callback(correlation_id, success=None, results=None,
-                     error=None, details=None):
-            """ The default callback to pass to the API.
-
-            See the documentation for ``goTenna.driver``.
-
-            Does nothing but print whether the method succeeded or failed.
-            """
-            method = self.in_flight_events.pop(correlation_id.bytes,
-                                               'Method call')
-            if success:
-                if results:
-                    print("{} succeeded: {}".format(method, results))
-                else:
-                    print("{} succeeded!".format(method))
-            elif error:
-                if not captured_error_handler[0]:
-                    captured_error_handler[0] = default_error_handler
-                print("{} failed: {}".format(method,
-                                             captured_error_handler[0](details)))
-        return callback
 
     def do_set_gid(self, rem):
         """ Create a new profile (if it does not already exist) with default settings.
@@ -323,7 +499,7 @@ class goTennaCLI(cmd.Cmd):
                 print("Invitation of {} to {}: delivery unconfirmed, recipient may be offline or out of range"
                       .format(member_gid.gid_val, group_gid.gid_val))
         corr_id = self.api_thread.invite_to_group(group_to_invite, member_idx,
-                                                  self.build_callback(),
+                                                  build_callback(self.in_flight_events),
                                                   ack_callback=ack_callback)
         self.in_flight_events[corr_id.bytes] = 'Invitation of {} to {}'\
             .format(group_gid.gid_val, member_gid.gid_val)
@@ -416,7 +592,7 @@ class goTennaCLI(cmd.Cmd):
                 return "Error sending echo command: {}".format(details)
 
             try:
-                method_callback = self.build_callback(error_handler)
+                method_callback = build_callback(self.in_flight_events, error_handler)
                 corr_id = self.api_thread.echo(method_callback)
             except ValueError:
                 print("Echo failed!")
@@ -431,15 +607,8 @@ class goTennaCLI(cmd.Cmd):
         if not self.api_thread.connected:
             print("No device connected")
         else:
-            def error_handler(details):
-                """ A special error handler for formatting message failures
-                """
-                if details['code'] in [goTenna.constants.ErrorCodes.TIMEOUT,
-                                       goTenna.constants.ErrorCodes.OSERROR]:
-                    return "Message may not have been sent: USB connection disrupted"
-                return "Error sending message: {}".format(details)
             try:
-                method_callback = self.build_callback(error_handler)
+                method_callback = build_callback(self.in_flight_events)
                 payload = goTenna.payload.TextPayload(message)
                 corr_id = self.api_thread.send_broadcast(payload,
                                                          method_callback)
@@ -482,13 +651,9 @@ class goTennaCLI(cmd.Cmd):
         if not gid:
             return
         message = rest
-        def error_handler(details):
-            """ Special error handler for sending private messages to format errors
-            """
-            return "Error sending message: {}".format(details)
 
         try:
-            method_callback = self.build_callback(error_handler)
+            method_callback = build_callback(self.in_flight_events)
             payload = goTenna.payload.TextPayload(message)
             def ack_callback(correlation_id, success):
                 if success:
@@ -532,7 +697,7 @@ class goTennaCLI(cmd.Cmd):
         try:
             payload = goTenna.payload.TextPayload(message)
             corr_id = self.api_thread.send_group(group, payload,
-                                                 self.build_callback(),
+                                                 build_callback(self.in_flight_events),
                                                  encrypt=self._do_encryption)
         except ValueError:
             print("message too long!")
@@ -918,10 +1083,11 @@ class goTennaCLI(cmd.Cmd):
             for n in range(1, len(lines), 2):
                 if lines[n] != b'OK':
                     fields = lines[n].split(b",")
-                    phone_number = fields[2].strip(b'"')
-                    received = fields[4].strip(b'"')
-                    message = lines[n+1]
-                    msgs.append({'phone_number':phone_number, 'received':received, 'message':message})
+                    if len(fields) > 3:
+                        phone_number = fields[2].strip(b'"')
+                        received = fields[4].strip(b'"')
+                        message = lines[n+1]
+                        msgs.append({'phone_number':phone_number, 'received':received, 'message':message})
 
         if len(msgs) > 0:
             if callback != None:
@@ -944,7 +1110,7 @@ class goTennaCLI(cmd.Cmd):
                 self.send_ser_command(DELETE_READ_SENT)
 
         except serial.SerialTimeoutException:
-            sprint("SerialTimeoutException")
+            print("SerialTimeoutException")
 
     def do_init_sms(self, args):
         """ Initialize the SMS Modem once when program launched
@@ -1049,4 +1215,5 @@ def run_cli():
         cli_obj.do_quit('')
 
 if __name__ == '__main__':
+
     run_cli()
