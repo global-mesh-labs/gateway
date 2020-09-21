@@ -1,6 +1,7 @@
-""" sms_gateway.py - A example of using the goTenna API for a simple command line messaging application.
+""" mesh_gateway.py - A example of using the goTenna API for a command line messaging application
+                      and SMS gateway.
 
-Usage: python sms_gateway.py
+Usage: python mesh_gateway.py
 """
 from __future__ import print_function
 import cmd # for the command line application
@@ -15,7 +16,6 @@ import serial
 import time
 from time import sleep
 import cbor
-from txtenna import TxTenna
 import threading
 import socket
 import select
@@ -25,12 +25,6 @@ PHONE_NUMBER_CBOR_TAG = 25
 MESSAGE_TEXT_CBOR_TAG = 26
 SEGMENT_NUMBER_CBOR_TAG = 28
 SEGMENT_COUNT_CBOR_TAG = 29
-TXTENNA_ID_CBOR_TAG = 30
-TRANSACTION_HASH_CBOR_TAG = 31
-TXID_CBOR_TAG = 31
-HOST_CBOR_TAG = 32
-PORT_CBOR_TAG = 33
-SOCKET_ID_CBOR_TAG = 34
 
 # For SPI connection only, set SPI_CONNECTION to true with proper SPI settings
 SPI_CONNECTION = False
@@ -55,59 +49,6 @@ except ImportError:
     pass
 
 GATEWAY_GID = "555555555"
-in_flight_events = {}
-
-def mesh_socket_write(data, index, count, api_thread, gid, socket_id, in_flight_events):
-    if api_thread is None or api_thread.connect is False:
-        return None
-
-    offset = index * MESH_PAYLOAD_SIZE
-    end = min([offset+MESH_PAYLOAD_SIZE, len(data)])
-
-    print("Private (socket) {} of {} messages to {}: socket {}, length = {}."
-        .format(index, count, gid, socket_id, len(data[offset:end])))
-
-    d = {
-        SOCKET_ID_CBOR_TAG : socket_id,
-        SEGMENT_NUMBER_CBOR_TAG : index,
-        SEGMENT_COUNT_CBOR_TAG : count,
-        BYTE_STRING_CBOR_TAG : data[offset:end]
-    }
-    protocol_msg = cbor.dumps(d)
-    # print("socket_id: {}, data: {}".format(socket_id.hex(), data.decode('utf-8')))
-
-    try:
-        method_callback = build_callback(in_flight_events)
-        payload = goTenna.payload.BinaryPayload(protocol_msg)
-        payload.set_sender_initials('f')
-        def ack_callback(correlation_id, success):
-            if success:
-                print("Private (socket) message: delivery confirmed")
-            else:
-                print("Private (socket) message: delivery not confirmed, recipient may be offline or out of range")
-        gidobj = goTenna.settings.GID(int(gid), goTenna.settings.GID.PRIVATE)
-
-        corr_id = None
-        attempts = 0
-        while corr_id is None and attempts < 5:
-            corr_id = api_thread.send_private(gidobj, payload,
-                                                    method_callback,
-                                                    ack_callback=ack_callback,
-                                                    encrypt=False)
-            if corr_id is None:
-                attempts += 1
-                sleep(20)
-    except ValueError:
-        print("Message too long!")
-        return
-
-    if corr_id is not None:
-        in_flight_events[corr_id.bytes]\
-            = 'Private message to {}: socket_id:{}, index:{}, count:{}'.format(gid, socket_id.hex(), index, count)
-    else:
-        print("corr_id is None!")
-
-    return corr_id
 
 def build_callback(in_flight_events, error_handler=None):
     """ Build a callback for sending to the API thread. May speciy a callable
@@ -144,81 +85,6 @@ def build_callback(in_flight_events, error_handler=None):
             print("{} failed: {}".format(method, captured_error_handler[0](details)))
     return callback
 
-class MeshSocket:
-    """demonstration class only
-      - coded for clarity, not efficiency
-    """
-
-    def __init__(self, api_thread, gid, socket_id, in_flight_events):
-        self.api_thread = api_thread
-        self.gid = gid
-        self.socket_id = socket_id
-        self.socket_thread = None
-        self.mesh_thread = None
-        self.in_flight_events = in_flight_events
-        self.buffer = b''
-        self.write_to_mesh_queue=[]
-        self.running = False
-
-    def connect(self, host, port):
-        self.sock = socket.create_connection((host, port))
-        self.sock.setblocking(0)
-
-    def socket_send(self, data, index, count):
-        print("Received (socket) {} of {} messages from {}: socket {}, length = {}".
-            format(index, count, self.gid, self.socket_id, len(data)))
-        self.buffer = self.buffer + data
-        if index == count - 1:
-            totalsent = 0
-            while totalsent < len(self.buffer):
-                sent = self.sock.send(self.buffer[totalsent:])
-                if sent == 0:
-                    raise RuntimeError("socket connection broken")
-                totalsent = totalsent + sent
-            self.buffer = b''
-
-    def readytoread(self):
-        ready_to_read, ready_to_write, in_error = \
-               select.select([self.sock],[],[])
-        return self.sock in ready_to_read 
-    
-    def run(self):
-        self.socket_thread = threading.Thread(target=self.read_socket_thread, args=())
-        self.mesh_thread = threading.Thread(target=self.write_mesh_thread, args=())
-        self.running = True
-        self.socket_thread.start()
-        self.mesh_thread.start()
-
-    def read_socket_thread(self):
-        timeout = 0
-        while self.running:
-            try:
-                data = self.sock.recv(DEFAULT_BUF_SIZE)
-            except BlockingIOError:
-                sleep(1)
-                continue
-            except ConnectionResetError:
-                print("MeshSocket: run_thread(), ConnectionResetError.")
-                self.running = False
-                break
-            if data != b'':
-                self.write_to_mesh_queue.append(data)
-                timeout = 0
-            else:
-                sleep(1)
-                timeout += 1
-
-    def write_mesh_thread(self):
-        while self.running:
-            if (len(self.write_to_mesh_queue) > 0):
-                data = self.write_to_mesh_queue.pop()
-                count = int(math.ceil(len(data) / MESH_PAYLOAD_SIZE))
-                for index in range(0, count) :
-                    # blocks if data rate is exceeded 
-                    mesh_socket_write(data, index, count, self.api_thread, self.gid, self.socket_id, self.in_flight_events)
-            else:
-                sleep(1)
-
 class goTennaCLI(cmd.Cmd):
     """ CLI handler function
     """
@@ -226,7 +92,7 @@ class goTennaCLI(cmd.Cmd):
         self.api_thread = None
         self.status = {}
         cmd.Cmd.__init__(self)
-        self.prompt = 'SMS Gateway>'
+        self.prompt = 'Mesh Gateway>'
         self.in_flight_events = {}
         self._set_frequencies = False
         self._set_tx_power = False
@@ -240,10 +106,7 @@ class goTennaCLI(cmd.Cmd):
         self.serial_port = None
         self.serial_rate = 115200
         self.sms_sender_dict = {}
-        self.txtenna = None
         self.serial = None
-
-        self.socket_dict = {}
 
         # prevent threads from accessing serial port simultaneiously
         self.serial_lock = threading.Lock() 
@@ -294,59 +157,10 @@ class goTennaCLI(cmd.Cmd):
                         text_message = protocol_msg[MESSAGE_TEXT_CBOR_TAG]
                         self.do_send_sms("+" + phone_number + " " + text_message)
                         self.sms_sender_dict[phone_number.encode()] = str(evt.message.sender.gid_val).encode()
-                    elif TXTENNA_ID_CBOR_TAG in protocol_msg:
-                        if self.txtenna != None:
-                            self.txtenna.handle_cbor_message(evt.message.sender.gid_val, protocol_msg)
-                        else:
-                            print("TxTenna BinaryPayload received but ignored.")
-                    elif HOST_CBOR_TAG in protocol_msg and PORT_CBOR_TAG in protocol_msg and SOCKET_ID_CBOR_TAG in protocol_msg:
-                        host = protocol_msg[HOST_CBOR_TAG]
-                        port = protocol_msg[PORT_CBOR_TAG]
-                        socket_id = protocol_msg[SOCKET_ID_CBOR_TAG]
-                        gid = str(evt.message.sender.gid_val).encode()
-                        count = protocol_msg[SEGMENT_COUNT_CBOR_TAG]
-
-                        if socket_id not in self.socket_dict or self.socket_dict[socket_id].running == False:
-                            self.socket_dict[socket_id] = MeshSocket(self.api_thread, gid, socket_id, self.in_flight_events)
-                            try:
-                                self.socket_dict[socket_id].connect(host, port)
-                            except ConnectionRefusedError:
-                                self.socket_dict[socket_id].send_private(b'')
-                                return
-                            self.socket_dict[socket_id].run()
-
-                        if BYTE_STRING_CBOR_TAG in protocol_msg:
-                            data = protocol_msg[BYTE_STRING_CBOR_TAG]
-                            self.socket_dict[socket_id].socket_send(data, 0, count)
-
-                    elif BYTE_STRING_CBOR_TAG in protocol_msg and SOCKET_ID_CBOR_TAG in protocol_msg:
-                        socket_id = protocol_msg[SOCKET_ID_CBOR_TAG]
-                        if socket_id in self.socket_dict:
-                            data = protocol_msg[BYTE_STRING_CBOR_TAG]
-                            count = protocol_msg[SEGMENT_COUNT_CBOR_TAG]
-                            index = protocol_msg[SEGMENT_NUMBER_CBOR_TAG]
-                            self.socket_dict[socket_id].socket_send(data, index, count)
-                    else:
-                        print("Unknown BinaryPayload.")
                 elif type(evt.message.payload) == goTenna.payload.CustomPayload:
-                    print("Unknown CustomPayload.")
+                    print("Unknown BinaryPayload.")
                 else:
-                    # check for correct (legacy) text SMS format
-                    parsed_payload = re.fullmatch(r"([\+]?)([0-9]{9,15})\s(.+)", evt.message.payload.message)
-                    if parsed_payload != None:
-                        phone_number = parsed_payload[2]
-                        text_message = parsed_payload[3]
-                        # send to SMS Modem
-                        self.do_send_sms("+" + phone_number + " " + text_message)
-                        
-                        # keep track of mapping of sms destination to mesh sender
-                        self.sms_sender_dict[phone_number.encode()] = str(evt.message.sender.gid_val).encode()
-            except BrokenPipeError:
-                self.socket_dict.pop(socket_id)
-            except ConnectionResetError:
-                self.socket_dict.pop(socket_id)
-            except ConnectionRefusedError:
-                self.socket_dict.pop(socket_id)
+                    print("Gateway received text message: " + evt.message.payload.message)
             except Exception: # pylint: disable=broad-except
                 traceback.print_exc()
         elif evt.event_type == goTenna.driver.Event.DEVICE_PRESENT:
@@ -1145,15 +959,6 @@ class goTennaCLI(cmd.Cmd):
         except serial.SerialTimeoutException:
             print("SerialTimeoutException")
 
-'''
-    class to add TxTenna functionality to SMS gateway
-'''
-class goTennaCLI_TxTenna(goTennaCLI, TxTenna):
-    def __init__(self, local_gid, local, send_dir, receive_dir, pipe):
-        goTennaCLI.__init__(self)
-        TxTenna.__init__(self, local_gid, local, send_dir, receive_dir, pipe)
-    pass
-
 def run_cli():
     """ The main function of the sample app.
 
@@ -1171,28 +976,9 @@ def run_cli():
                         help='The serial port of the GSM modem.')
     parser.add_argument('SERIAL_RATE', type=six.b,
                         help='The speed of the serial port of the GSM modem.')
-    
-    # TxTenna parameters
-    parser.add_argument("--gateway", action="store_true",
-                        help="Use this computer as an internet connected transaction gateway with a default GID")
-    parser.add_argument("--local", action="store_true",
-                        help="Use local bitcoind to confirm and broadcast transactions")
-    parser.add_argument("--send_dir",
-                        help="Broadcast message data from files in this directory")
-    parser.add_argument("--receive_dir",
-                        help="Write files from received message data in this directory")
-    parser.add_argument('-p', '--pipe',
-                        default='/tmp/blocksat/api',
-                        help='Pipe on which relayed message data is written out to ' +
-                        '(default: /tmp/blocksat/api)')                       
+                      
     args = parser.parse_args()  
-
-    if (args.gateway):
-        cli_obj = goTennaCLI_TxTenna(GATEWAY_GID, args.local, args.send_dir, args.receive_dir, args.pipe)
-        cli_obj.txtenna = cli_obj
-
-    else:
-        cli_obj = goTennaCLI()
+    cli_obj = goTennaCLI()
 
     ## start goTenna SDK thread by setting the SDK token
     cli_obj.do_sdk_token(args.SDK_TOKEN)
