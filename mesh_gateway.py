@@ -19,6 +19,11 @@ import cbor
 import threading
 import socket
 import select
+import requests
+import json
+import configparser
+from threading import Thread
+from datetime import datetime, timedelta
 
 BYTE_STRING_CBOR_TAG = 24
 PHONE_NUMBER_CBOR_TAG = 25
@@ -47,8 +52,6 @@ try:
     assert readline # silence pyflakes
 except ImportError:
     pass
-
-GATEWAY_GID = "555555555"
 
 def build_callback(in_flight_events, error_handler=None):
     """ Build a callback for sending to the API thread. May speciy a callable
@@ -107,6 +110,20 @@ class goTennaCLI(cmd.Cmd):
         self.serial_rate = 115200
         self.sms_sender_dict = {}
         self.serial = None
+
+        # imeshyou information
+        self.email = ''
+        self.password = ''
+        self.node_name = None
+        self.latlong = []
+        self.range = 1
+        self.use_tags = []
+        self.node_id = None
+        self.imeshyou_thread = None
+        self.imeshyou_last_update = None
+        
+        self.session_token = None
+        self.user_id = None
 
         # prevent threads from accessing serial port simultaneiously
         self.serial_lock = threading.Lock() 
@@ -386,6 +403,9 @@ class goTennaCLI(cmd.Cmd):
         if self.serial and self.serial.is_open:
             self.serial.close()
             self.serial = None
+        if self.imeshyou_thread:
+            self.imeshyou_last_update = None
+            self.imeshyou_thread.join()
 
         return True
 
@@ -959,6 +979,89 @@ class goTennaCLI(cmd.Cmd):
         except serial.SerialTimeoutException:
             print("SerialTimeoutException")
 
+    def do_login_node(self, args):
+        url = 'https://users-api-stage-new.gotennamesh.com/v1/users/login'
+        headers = {'Content-Type':'application/json'}
+        body = json.dumps({"email":self.email, "password":self.password})
+        response = requests.post(url, headers=headers, data=body)
+        if (response.status_code == 200):
+            response_json = json.loads(response.content)
+            self.session_token = response_json['session_token']
+            self.user_id = response_json['id']
+            print("login_node: session_token= " + self.session_token + ", user_id= " + self.user_id)
+        else:
+            print("login command failed: status code=" + str(response.status_code) + " reason: " + response.reason)
+
+    def do_get_node(self, args):
+        print("get_node " + args)
+        url = 'https://api-stage.imeshyou.com/nodes/' + args + "?fields=description,use,name,is_ambassador,gateway,user"
+        headers = {'Content-Type':'application/json'}
+        response = requests.get(url, headers=headers)
+        if (response.status_code == 200):
+            response_json = json.loads(response.content)
+            print(response_json)
+        else:
+            print("command failed: status code=" + str(response.status_code) + " reason: " + response.reason)
+
+    def do_add_node(self, args):
+        url = 'https://api-stage.imeshyou.com/nodes'
+        headers = {'Content-Type':'application/json', 'SESSION_TOKEN':self.session_token, 'Authorization':'Bearer '+self.session_token}
+        body = json.dumps({'lat':self.latlong[0], 'long':self.latlong[1], 'gotenna_user_id':self.user_id, 'name':self.node_name, 'is_ambassador':False,
+            'show_profile':False, 'always_on':False, 'use':['sms gateway'], 'range': self.range, 'description':'', 'user_id':self.user_id, 'gateway':True})
+        response = requests.post(url, headers=headers, data=body)
+        if (response.status_code == 200):
+            response_json = json.loads(response.content)
+            self.node_id = response_json['_id']
+            print("add_node: node_id=" + self.node_id)
+        else:
+            print("add_node command failed: status code=" + str(response.status_code) + " reason: " + response.reason)
+
+
+    def do_update_node(self, args):
+        if args != '':
+            node_id = args
+        else:
+            node_id = self.node_id
+        print("update_node: node_id= " + str(node_id))
+        if node_id is None:
+            print("update_node command failed: node_id not defined.")
+            return 
+        url = 'https://api-stage.imeshyou.com/nodes/' + node_id
+        headers = {'Content-Type':'application/json', 'SESSION_TOKEN':self.session_token, 'Authorization':'Bearer '+self.session_token}
+        body = json.dumps({'_id':node_id, 'name':self.node_name, 'use':['sms gateway'], 'range':self.range, 'description':'', 'gotenna_user_id':self.user_id, 'gateway':True})
+        response = requests.put(url, headers=headers, data=body)
+        if (response.status_code == 200):
+            response_json = json.loads(response.content)
+            self.node_id = response_json['_id']
+        else:
+            print("update_node command failed: status code=" + str(response.status_code) + " reason: " + response.reason)
+
+    def do_delete_node(self, args):
+        if args != '':
+            self.node_id = args
+        print("delete_node: node_id= " + str(self.node_id))
+        if self.node_id is None:
+            print("delete_node command failed: node_id not defined.")
+            return
+        url = 'https://api-stage.imeshyou.com/nodes/' + self.node_id
+        headers = {'Content-Type':'application/json', 'SESSION_TOKEN':self.session_token, 'Authorization':'Bearer '+self.session_token}
+        response = requests.delete(url, headers=headers)
+        if (response.status_code == 200):
+            response_json = json.loads(response.content)
+            self.node_id = None
+        else:
+            print("delete_node command failed: status code=" + str(response.status_code) + " reason: " + response.reason)
+
+    def update_imeshyou(self, ):
+        self.do_update_node("")
+        self.imeshyou_last_update = datetime.now()
+        while self.imeshyou_last_update != None:
+            if self.imeshyou_last_update + timedelta(hours=1) < datetime.now():
+                # refresh last update time of node on imeshyou web site
+                self.do_update_node("")
+                self.imeshyou_last_update = datetime.now()
+            sleep(10)
+
 def run_cli():
     """ The main function of the sample app.
 
@@ -968,29 +1071,43 @@ def run_cli():
     import six
 
     parser = argparse.ArgumentParser('Run a SMS message goTenna gateway')
-    parser.add_argument('SDK_TOKEN', type=six.b,
-                        help='The token for the goTenna SDK.')
-    parser.add_argument('GEO_REGION', type=six.b,
-                        help='The geo region number you are in.')
-    parser.add_argument('SERIAL_PORT',
-                        help='The serial port of the GSM modem.')
-    parser.add_argument('SERIAL_RATE', type=six.b,
-                        help='The speed of the serial port of the GSM modem.')
+    parser.add_argument('--config', type=str, default="mesh_gateway.ini",
+                        help='configuration file')
                       
     args = parser.parse_args()  
+
+    config = configparser.ConfigParser()
+    config.read(args.config)
+
     cli_obj = goTennaCLI()
+    if config.has_section('gotenna'):
+        cli_obj.do_sdk_token(config['gotenna']['sdk_token'])
+        cli_obj.do_set_geo_region(config['gotenna']['geo_region'])
+        cli_obj.do_set_gid(config['gotenna']['gateway_gid'])
 
-    ## start goTenna SDK thread by setting the SDK token
-    cli_obj.do_sdk_token(args.SDK_TOKEN)
+    if config.has_section('sms'):
+        cli_obj.serial_port = config['sms']['serial_port']
+        cli_obj.serial_rate = config['sms']['serial_rate']
 
-    ## set geo region
-    cli_obj.do_set_geo_region(args.GEO_REGION)
+    if config.has_section('imeshyou'):
+        cli_obj.email = config['imeshyou']['email']
+        cli_obj.password = config['imeshyou']['password']
+        cli_obj.do_login_node("")
 
-    cli_obj.do_set_gid(GATEWAY_GID)
-    print("set gid=",GATEWAY_GID)
+        cli_obj.latlong = json.loads(config['imeshyou']['latlong'])
+        cli_obj.range = config['imeshyou']['range']
+        cli_obj.use_tags = json.loads(config['imeshyou']['use_tags'])
+        cli_obj.node_id = config['imeshyou']['node_id']
 
-    cli_obj.serial_port = args.SERIAL_PORT
-    cli_obj.serial_rate = args.SERIAL_RATE
+        if cli_obj.node_id == '':
+            cli_obj.do_add_node("")
+            config['imeshyou']['node_id'] = cli_obj.node_id
+            with open(args.config, 'w') as configfile:
+                config.write(configfile)
+        
+        if cli_obj.node_id != '':
+            cli_obj.imeshyou_thread = Thread(target = cli_obj.update_imeshyou)
+            cli_obj.imeshyou_thread.start()
 
     try:
         sleep(5)
