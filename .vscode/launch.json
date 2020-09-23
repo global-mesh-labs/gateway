@@ -10,7 +10,7 @@
             "type": "python",
             "request": "launch",
             "program": "${workspaceFolder}/mesh_gateway.py",
-            "args": ["FhkTSkINBkUDUhxEV10NBx5SRARHUlgDB0BcBlsDCA4QCgRKB0VDBV8IQg4XSERf", "2", "/dev/cu.USB Application Port1433423", "115200"],
+            "args": ["--config","staging.ini"],
             "console": "integratedTerminal",
         },
     ]
