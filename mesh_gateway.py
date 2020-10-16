@@ -881,6 +881,8 @@ class goTennaCLI(cmd.Cmd):
         for m in msgs:
             print("\tReceived: {}".format(m['received']))
             print("\tMessage: {}".format(m['message']))
+            print("phone_number=[{}]".format(m['phone_number']))
+            print("sms_sender_dict={}".format(str(sms_sender_dict)))
             
             if m['phone_number'] in self.sms_sender_dict:
                 mesh_sender_gid = self.sms_sender_dict[m['phone_number']]
@@ -1007,7 +1009,7 @@ class goTennaCLI(cmd.Cmd):
         url = 'https://api-stage.imeshyou.com/nodes'
         headers = {'Content-Type':'application/json', 'SESSION_TOKEN':self.session_token, 'Authorization':'Bearer '+self.session_token}
         body = json.dumps({'lat':self.latlong[0], 'long':self.latlong[1], 'gotenna_user_id':self.user_id, 'name':self.node_name, 'is_ambassador':False,
-            'show_profile':False, 'always_on':False, 'use':self.use_tags, 'range':self.range, 'description':'', 'user_id':self.user_id, 'gateway':True})
+            'show_profile':False, 'always_on':True, 'use':self.use_tags, 'range':self.range, 'description':'', 'user_id':self.user_id, 'gateway':True})
         response = requests.post(url, headers=headers, data=body)
         if (response.status_code == 200):
             response_json = json.loads(response.content)
@@ -1028,7 +1030,7 @@ class goTennaCLI(cmd.Cmd):
             return 
         url = 'https://api-stage.imeshyou.com/nodes/' + node_id
         headers = {'Content-Type':'application/json', 'SESSION_TOKEN':self.session_token, 'Authorization':'Bearer '+self.session_token}
-        body = json.dumps({'_id':node_id, 'name':self.node_name, 'use':self.use_tags, 'range':self.range, 'description':'', 'gotenna_user_id':self.user_id, 'gateway':True})
+        body = json.dumps({'_id':node_id, 'name':self.node_name, 'always_on':True, 'use':self.use_tags, 'range':self.range, 'description':'', 'gotenna_user_id':self.user_id, 'gateway':True})
         response = requests.put(url, headers=headers, data=body)
         if (response.status_code == 200):
             response_json = json.loads(response.content)
