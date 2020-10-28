@@ -882,7 +882,7 @@ class goTennaCLI(cmd.Cmd):
             print("\tReceived: {}".format(m['received']))
             print("\tMessage: {}".format(m['message']))
             print("phone_number=[{}]".format(m['phone_number']))
-            print("sms_sender_dict={}".format(str(sms_sender_dict)))
+            print("sms_sender_dict={}".format(str(self.sms_sender_dict)))
             
             if m['phone_number'] in self.sms_sender_dict:
                 mesh_sender_gid = self.sms_sender_dict[m['phone_number']]
@@ -920,7 +920,7 @@ class goTennaCLI(cmd.Cmd):
                 if lines[n] != b'OK':
                     fields = lines[n].split(b",")
                     if len(fields) > 3:
-                        phone_number = fields[2].strip(b'"')
+                        phone_number = fields[2].strip(b'"+')
                         received = fields[4].strip(b'"')
                         message = lines[n+1]
                         msgs.append({'phone_number':phone_number, 'received':received, 'message':message})
