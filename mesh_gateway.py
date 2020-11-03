@@ -1100,6 +1100,7 @@ def run_cli():
         cli_obj.range = config['imeshyou']['range']
         cli_obj.use_tags = json.loads(config['imeshyou']['use_tags'])
         cli_obj.node_id = config['imeshyou']['node_id']
+        cli_obj.node_name = config['imeshyou']['node_name']
 
         if cli_obj.node_id == '':
             cli_obj.do_add_node("")
