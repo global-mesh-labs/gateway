@@ -57,34 +57,24 @@ except ImportError:
 GATEWAY_GID = "555555555"
 in_flight_events = {}
 
-def mesh_socket_write(data, index, count, api_thread, gid, socket_id, in_flight_events):
+def mesh_socket_write(data, api_thread, gid, socket_id, in_flight_events):
     if api_thread is None or api_thread.connect is False:
         return None
 
-    offset = index * MESH_PAYLOAD_SIZE
-    end = min([offset+MESH_PAYLOAD_SIZE, len(data)])
-
-    print("Private (socket) {} of {} messages to {}: socket {}, length = {}."
-        .format(index, count, gid, socket_id, len(data[offset:end])))
-
-    d = {
-        SOCKET_ID_CBOR_TAG : socket_id,
-        SEGMENT_NUMBER_CBOR_TAG : index,
-        SEGMENT_COUNT_CBOR_TAG : count,
-        BYTE_STRING_CBOR_TAG : data[offset:end]
-    }
-    protocol_msg = cbor.dumps(d)
-    # print("socket_id: {}, data: {}".format(socket_id.hex(), data.decode('utf-8')))
+    # wait until last message delivered or failed
+    while (len(in_flight_events) > 0):
+        sleep(10)
 
     try:
         method_callback = build_callback(in_flight_events)
-        payload = goTenna.payload.BinaryPayload(protocol_msg)
+        payload = goTenna.payload.BinaryPayload(data)
         payload.set_sender_initials('f')
         def ack_callback(correlation_id, success):
             if success:
-                print("Private (socket) message: delivery confirmed")
+                print("Private (socket) correlation_id={} message: delivery confirmed".format(correlation_id))
             else:
-                print("Private (socket) message: delivery not confirmed, recipient may be offline or out of range")
+                print("Private (socket) correlation_id={} message: delivery not confirmed, recipient may be offline or out of range".format(correlation_id))
+
         gidobj = goTenna.settings.GID(int(gid), goTenna.settings.GID.PRIVATE)
 
         corr_id = None
@@ -103,7 +93,7 @@ def mesh_socket_write(data, index, count, api_thread, gid, socket_id, in_flight_
 
     if corr_id is not None:
         in_flight_events[corr_id.bytes]\
-            = 'Private message to {}: socket_id:{}, index:{}, count:{}'.format(gid, socket_id.hex(), index, count)
+            = 'Private message from socket_id:{} sent to {}: corr_id={}'.format(socket_id.hex(), gid, corr_id)
     else:
         print("corr_id is None!")
 
@@ -161,21 +151,29 @@ class MeshSocket:
         self.running = False
 
     def connect(self, host, port):
+        self.sock = socket.socket()
+        self.sock.settimeout(60000)
         self.sock = socket.create_connection((host, port))
         self.sock.setblocking(0)
+
+    def disconnect(self):
+        try:
+            self.sock.close()
+        except:
+            print("Closing socket {}: exception".format(self.socket_id))
 
     def socket_send(self, data, index, count):
         print("Received (socket) {} of {} messages from {}: socket {}, length = {}".
             format(index, count, self.gid, self.socket_id, len(data)))
         self.buffer = self.buffer + data
-        if index == count - 1:
-            totalsent = 0
-            while totalsent < len(self.buffer):
-                sent = self.sock.send(self.buffer[totalsent:])
-                if sent == 0:
-                    raise RuntimeError("socket connection broken")
-                totalsent = totalsent + sent
-            self.buffer = b''
+        # if index == count - 1:
+        totalsent = 0
+        while totalsent < len(self.buffer):
+            sent = self.sock.send(self.buffer[totalsent:])
+            if sent == 0:
+                raise RuntimeError("socket connection broken")
+            totalsent = totalsent + sent
+        self.buffer = b''
 
     def readytoread(self):
         ready_to_read, ready_to_write, in_error = \
@@ -189,8 +187,13 @@ class MeshSocket:
         self.socket_thread.start()
         self.mesh_thread.start()
 
+    def return_connect_failed(self):
+        print("return_connect_failed, socket_id={}".format(self.socket_id))
+        mesh_socket_write(b'', self.api_thread, self.gid, self.socket_id, self.in_flight_events)
+
     def read_socket_thread(self):
         timeout = 0
+        retries = 0
         while self.running:
             try:
                 data = self.sock.recv(DEFAULT_BUF_SIZE)
@@ -198,26 +201,45 @@ class MeshSocket:
                 sleep(1)
                 continue
             except ConnectionResetError:
-                print("MeshSocket: run_thread(), ConnectionResetError.")
-                self.running = False
-                break
+                # TODO: stop socket threads that have been idle and/or when peers disconnect
+                print("MeshSocket: read_socket_thread(), peer socket threw ConnectionResetError. {}/{}".format(str(retries), str(10)))
+                if retries > 10:
+                    self.running = False
+                    break
+                retries = retries + 1
+                continue
             if data != b'':
-                self.write_to_mesh_queue.append(data)
+                count = int(math.ceil(len(data) / MESH_PAYLOAD_SIZE))
+                for index in range(0, count) :
+                    offset = index * MESH_PAYLOAD_SIZE
+                    end = min([offset+MESH_PAYLOAD_SIZE, len(data)])
+                    d = {
+                        SOCKET_ID_CBOR_TAG : self.socket_id,
+                        SEGMENT_NUMBER_CBOR_TAG : index,
+                        SEGMENT_COUNT_CBOR_TAG : count,
+                        BYTE_STRING_CBOR_TAG : data[offset:end]
+                    }
+                    protocol_msg = cbor.dumps(d)
+                    print("Queue socket_id: {} from {}, {}/{}, len: {}, data: [{}]".format(self.socket_id.hex(), self.sock.getpeername(), index, count, len(protocol_msg), str(protocol_msg[-8:])))
+                    self.write_to_mesh_queue.append(protocol_msg)
                 timeout = 0
             else:
                 sleep(1)
                 timeout += 1
+            if (timeout > 600):
+                # stop socket thread that is idle for > 10 min
+                self.running = False
 
     def write_mesh_thread(self):
         while self.running:
             if (len(self.write_to_mesh_queue) > 0):
-                data = self.write_to_mesh_queue.pop()
-                count = int(math.ceil(len(data) / MESH_PAYLOAD_SIZE))
-                for index in range(0, count) :
-                    # blocks if data rate is exceeded 
-                    mesh_socket_write(data, index, count, self.api_thread, self.gid, self.socket_id, self.in_flight_events)
+                data = self.write_to_mesh_queue.pop(0)
+                print("Pop socket_id: {}, len: {}, data: [{}]".format(self.socket_id.hex(), len(data), str(data[-8:])))
+                # blocks if data rate is exceeded 
+                mesh_socket_write(data, self.api_thread, self.gid, self.socket_id, self.in_flight_events)
             else:
                 sleep(1)
+        self.disconnect()
 
 class goTennaCLI(cmd.Cmd):
     """ CLI handler function
@@ -311,7 +333,13 @@ class goTennaCLI(cmd.Cmd):
                             try:
                                 self.socket_dict[socket_id].connect(host, port)
                             except ConnectionRefusedError:
-                                self.socket_dict[socket_id].send_private(b'')
+                                print("Reply to mesh sender {} that socket failed to open!".format(gid))
+                                self.socket_dict[socket_id].return_connect_failed()
+                                return
+                            except Exception: # pylint: disable=broad-except
+                                traceback.print_exc()
+                                print("Reply to mesh sender {} that socket failed to open!".format(gid))
+                                self.socket_dict[socket_id].return_connect_failed()
                                 return
                             self.socket_dict[socket_id].run()
 
@@ -379,7 +407,8 @@ class goTennaCLI(cmd.Cmd):
             self.status = evt.status
             if self.serial != None:
                 # check for unread SMS messages
-                self.do_read_sms("", self.forward_to_mesh)
+                # self.do_read_sms("", self.forward_to_mesh)
+                return
 
         elif evt.event_type == goTenna.driver.Event.GROUP_CREATE:
             index = -1
@@ -555,11 +584,13 @@ class goTennaCLI(cmd.Cmd):
         self._locals  = {}      ## Initialize execution namespace for user
         self._globals = {}
         
+        """ skip GSM modem
         if self.serial_port != None:
             self.do_init_sms("")
 
         if self.serial != None:
             self.do_delete_sms("")
+        """
 
     def do_quit(self, arg):
         """ Safely quit.
