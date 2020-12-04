@@ -9,8 +9,8 @@
             "name": "gateway",
             "type": "python",
             "request": "launch",
-            "program": "${workspaceFolder}/sms_gateway.py",
-            "args": ["<SDK Token Here>", "2", "/dev/cu.USB Application Port1433423", "115200", "--gateway"],
+            "program": "${workspaceFolder}/mesh_gateway.py",
+            "args": ["--config","staging.ini"],
             "console": "integratedTerminal",
         },
     ]

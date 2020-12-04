@@ -4,9 +4,6 @@
 			"path": "."
 		},
 		{
-			"path": "../../../VSCode/txtenna-python"
-		},
-		{
 			"path": "../../../VSCode/go/lnd"
 		}
 	],
